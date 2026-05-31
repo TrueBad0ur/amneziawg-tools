@@ -96,7 +96,6 @@ struct wg_interface_io {
     uint8_t			i_public[WG_KEY_LEN];
     uint8_t			i_private[WG_KEY_LEN];
     size_t			i_peers_count;
-    struct wg_peer_io	i_peers[];
 
     uint16_t 			i_junk_packet_count;
     uint16_t 			i_junk_packet_min_size;
@@ -115,6 +114,8 @@ struct wg_interface_io {
     uint8_t* i_i3;
     uint8_t* i_i4;
     uint8_t* i_i5;
+
+    struct wg_peer_io	i_peers[];
 };
 
 struct wg_data_io {
