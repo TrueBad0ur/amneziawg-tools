@@ -108,12 +108,21 @@ auto_su() {
 
 get_real_interface() {
 	local interface line
+	# awg* named configs: interface is identical to config name
+	if [[ $INTERFACE =~ ^awg[0-9]+$ ]]; then
+		if ifconfig "$INTERFACE" >/dev/null 2>&1; then
+			REAL_INTERFACE="$INTERFACE"
+			return 0
+		fi
+		return 1
+	fi
+	# Arbitrary-named configs: search wg* and awg* for matching description
 	while IFS= read -r line; do
 		if [[ $line =~ ^([a-z]+[0-9]+):\ .+ ]]; then
 			interface="${BASH_REMATCH[1]}"
 			continue
 		fi
-		if [[ $interface == wg* && $line =~ ^\	description:\ wg-quick:\ (.+) && ${BASH_REMATCH[1]} == "$INTERFACE" ]]; then
+		if [[ ($interface == wg* || $interface == awg*) && $line =~ $'\t'description:\ wg-quick:\ (.+) && ${BASH_REMATCH[1]} == "$INTERFACE" ]]; then
 			REAL_INTERFACE="$interface"
 			return 0
 		fi
@@ -122,12 +131,32 @@ get_real_interface() {
 }
 
 add_if() {
+	local ret
+	# awg* interfaces are created by the kernel driver via ifconfig
+	if [[ $INTERFACE =~ ^awg[0-9]+$ ]]; then
+		if ret="$(cmd ifconfig "$INTERFACE" create 2>&1)"; then
+			REAL_INTERFACE="$INTERFACE"
+			return 0
+		fi
+		[[ $ret == *"File exists"* ]] && { REAL_INTERFACE="$INTERFACE"; return 0; }
+		echo "$ret" >&3
+		return 1
+	fi
+	# Arbitrary-named config: allocate awg{N} (AWG params) or wg{N} (plain WG)
 	while true; do
-		local -A existing_ifs="( $(wg show interfaces | sed 's/\([^ ]*\)/[\1]=1/g') )"
-		local index ret
+		local -A existing_ifs="( $(awg show interfaces | sed 's/\([^ ]*\)/[\1]=1/g') )"
+		local index
 		if [[ $IS_AWG_ON == 1 ]]; then
-			cmd "amneziawg-go "$INTERFACE"";
-			return $?
+			# AWG config with arbitrary name → kernel awg{N} with description
+			for ((index=0; index <= 2147483647; ++index)); do [[ -v existing_ifs[awg$index] ]] || break; done
+			if ret="$(cmd ifconfig awg$index create 2>&1)"; then
+				cmd ifconfig awg$index description "wg-quick: $INTERFACE"
+				REAL_INTERFACE="awg$index"
+				return 0
+			fi
+			[[ $ret == *"ifconfig: SIOCIFCREATE: File exists"* ]] && continue
+			echo "$ret" >&3
+			return 1
 		else
 			for ((index=0; index <= 2147483647; ++index)); do [[ -v existing_ifs[wg$index] ]] || break; done
 			if ret="$(cmd ifconfig wg$index create description "wg-quick: $INTERFACE" 2>&1)"; then
@@ -199,7 +228,7 @@ set_mtu() {
 		[[ ${BASH_REMATCH[1]} == *:* ]] && family=inet6
 		output="$(route -n get "-$family" "${BASH_REMATCH[1]}" || true)"
 		[[ $output =~ interface:\ ([^ ]+)$'\n' && $(ifconfig "${BASH_REMATCH[1]}") =~ mtu\ ([0-9]+) && ${BASH_REMATCH[1]} -gt $mtu ]] && mtu="${BASH_REMATCH[1]}"
-	done < <(wg show "$REAL_INTERFACE" endpoints)
+	done < <(awg show "$REAL_INTERFACE" endpoints)
 	if [[ $mtu -eq 0 ]]; then
 		read -r output < <(route -n get default || true) || true
 		[[ $output =~ interface:\ ([^ ]+)$'\n' && $(ifconfig "${BASH_REMATCH[1]}") =~ mtu\ ([0-9]+) && ${BASH_REMATCH[1]} -gt $mtu ]] && mtu="${BASH_REMATCH[1]}"
@@ -232,7 +261,7 @@ collect_endpoints() {
 	while read -r _ endpoint; do
 		[[ $endpoint =~ ^\[?([a-z0-9:.]+)\]?:[0-9]+$ ]] || continue
 		ENDPOINTS+=( "${BASH_REMATCH[1]}" )
-	done < <(wg show "$REAL_INTERFACE" endpoints)
+	done < <(awg show "$REAL_INTERFACE" endpoints)
 }
 
 set_endpoint_direct_route() {
@@ -361,7 +390,7 @@ add_route() {
 }
 
 set_config() {
-	cmd wg setconf "$REAL_INTERFACE" <(echo "$WG_CONFIG")
+	cmd awg setconf "$REAL_INTERFACE" <(echo "$WG_CONFIG")
 }
 
 save_config() {
@@ -391,7 +420,7 @@ save_config() {
 	done
 	old_umask="$(umask)"
 	umask 077
-	current_config="$(cmd wg showconf "$REAL_INTERFACE")"
+	current_config="$(cmd awg showconf "$REAL_INTERFACE")"
 	trap 'rm -f "$CONFIG_FILE.tmp"; exit' INT TERM EXIT
 	echo "${current_config/\[Interface\]$'\n'/$new_config}" > "$CONFIG_FILE.tmp" || die "Could not write configuration file"
 	sync "$CONFIG_FILE.tmp"
@@ -450,7 +479,7 @@ cmd_up() {
 	set_mtu
 	up_if
 	set_dns
-	for i in $(while read -r _ i; do for i in $i; do [[ $i =~ ^[0-9a-z:.]+/[0-9]+$ ]] && echo "$i"; done; done < <(wg show "$REAL_INTERFACE" allowed-ips) | sort -nr -k 2 -t /); do
+	for i in $(while read -r _ i; do for i in $i; do [[ $i =~ ^[0-9a-z:.]+/[0-9]+$ ]] && echo "$i"; done; done < <(awg show "$REAL_INTERFACE" allowed-ips) | sort -nr -k 2 -t /); do
 		add_route "$i"
 	done
 	[[ $AUTO_ROUTE4 -eq 1 || $AUTO_ROUTE6 -eq 1 ]] && set_endpoint_direct_route

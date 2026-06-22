@@ -13,11 +13,18 @@
 #include <sys/sockio.h>
 #include <sys/types.h>
 #include <net/if.h>
+#include <stdio.h>
 #include <net/if_wg.h>
+#include <net/if_awg.h>
 #include <netinet/in.h>
 #include "containers.h"
 
 #define IPC_SUPPORTS_KERNEL_INTERFACE
+
+static int is_awg_iface(const char *name)
+{
+	return strncmp(name, "awg", 3) == 0;
+}
 
 static int get_dgram_socket(void)
 {
@@ -27,14 +34,17 @@ static int get_dgram_socket(void)
 	return sock;
 }
 
-static int kernel_get_wireguard_interfaces(struct string_list *list)
+static int kernel_get_wireguard_interfaces_group(struct string_list *list, const char *group)
 {
-	struct ifgroupreq ifgr = { .ifgr_name = "wg" };
+	struct ifgroupreq ifgr;
 	struct ifg_req *ifg;
 	int s = get_dgram_socket(), ret = 0;
 
 	if (s < 0)
 		return -errno;
+
+	memset(&ifgr, 0, sizeof(ifgr));
+	strlcpy(ifgr.ifgr_name, group, sizeof(ifgr.ifgr_name));
 
 	if (ioctl(s, SIOCGIFGMEMB, (caddr_t)&ifgr) < 0)
 		return errno == ENOENT ? 0 : -errno;
@@ -58,8 +68,295 @@ out:
 	return ret;
 }
 
+static int kernel_get_wireguard_interfaces(struct string_list *list)
+{
+	int ret;
+
+	ret = kernel_get_wireguard_interfaces_group(list, "wg");
+	if (ret < 0)
+		return ret;
+	return kernel_get_wireguard_interfaces_group(list, "awg");
+}
+
+static int kernel_get_device_awg(struct wgdevice **device, const char *iface)
+{
+	struct awg_data_io awgdata = { .wgd_size = 0 };
+	struct awg_interface_io *awg_iface;
+	struct awg_peer_io *awg_peer;
+	struct awg_aip_io *awg_aip;
+	struct wgdevice *dev;
+	struct wgpeer *peer;
+	struct wgallowedip *aip;
+	int s = get_dgram_socket(), ret;
+	char hbuf[16];
+
+	if (s < 0)
+		return -errno;
+
+	*device = NULL;
+	strlcpy(awgdata.wgd_name, iface, sizeof(awgdata.wgd_name));
+	for (size_t last_size = awgdata.wgd_size;; last_size = awgdata.wgd_size) {
+		if (ioctl(s, SIOCGAWG, (caddr_t)&awgdata) < 0)
+			goto out;
+		if (last_size >= awgdata.wgd_size)
+			break;
+		awgdata.wgd_interface = realloc(awgdata.wgd_interface, awgdata.wgd_size);
+		if (!awgdata.wgd_interface)
+			goto out;
+	}
+
+	awg_iface = awgdata.wgd_interface;
+	dev = calloc(1, sizeof(*dev));
+	if (!dev)
+		goto out;
+	strlcpy(dev->name, iface, sizeof(dev->name));
+
+	if (awg_iface->i_flags & AWG_INTERFACE_HAS_RTABLE) {
+		dev->fwmark = awg_iface->i_rtable;
+		dev->flags |= WGDEVICE_HAS_FWMARK;
+	}
+	if (awg_iface->i_flags & AWG_INTERFACE_HAS_PORT) {
+		dev->listen_port = awg_iface->i_port;
+		dev->flags |= WGDEVICE_HAS_LISTEN_PORT;
+	}
+	if (awg_iface->i_flags & AWG_INTERFACE_HAS_PUBLIC) {
+		memcpy(dev->public_key, awg_iface->i_public, sizeof(dev->public_key));
+		dev->flags |= WGDEVICE_HAS_PUBLIC_KEY;
+	}
+	if (awg_iface->i_flags & AWG_INTERFACE_HAS_PRIVATE) {
+		memcpy(dev->private_key, awg_iface->i_private, sizeof(dev->private_key));
+		dev->flags |= WGDEVICE_HAS_PRIVATE_KEY;
+	}
+
+	if (awg_iface->i_flags & AWG_INTERFACE_HAS_JC) {
+		dev->junk_packet_count    = awg_iface->i_jc;
+		dev->junk_packet_min_size = awg_iface->i_jmin;
+		dev->junk_packet_max_size = awg_iface->i_jmax;
+		dev->flags |= WGDEVICE_HAS_JC | WGDEVICE_HAS_JMIN | WGDEVICE_HAS_JMAX;
+	}
+	if (awg_iface->i_flags & AWG_INTERFACE_HAS_S12) {
+		dev->init_packet_junk_size     = awg_iface->i_s1;
+		dev->response_packet_junk_size = awg_iface->i_s2;
+		dev->flags |= WGDEVICE_HAS_S1 | WGDEVICE_HAS_S2;
+	}
+	if (awg_iface->i_flags & AWG_INTERFACE_HAS_H) {
+		snprintf(hbuf, sizeof(hbuf), "%u", awg_iface->i_h1);
+		dev->init_packet_magic_header = strdup(hbuf);
+		if (!dev->init_packet_magic_header)
+			goto out;
+
+		snprintf(hbuf, sizeof(hbuf), "%u", awg_iface->i_h2);
+		dev->response_packet_magic_header = strdup(hbuf);
+		if (!dev->response_packet_magic_header)
+			goto out;
+
+		snprintf(hbuf, sizeof(hbuf), "%u", awg_iface->i_h3);
+		dev->underload_packet_magic_header = strdup(hbuf);
+		if (!dev->underload_packet_magic_header)
+			goto out;
+
+		snprintf(hbuf, sizeof(hbuf), "%u", awg_iface->i_h4);
+		dev->transport_packet_magic_header = strdup(hbuf);
+		if (!dev->transport_packet_magic_header)
+			goto out;
+
+		dev->flags |= WGDEVICE_HAS_H1 | WGDEVICE_HAS_H2 | WGDEVICE_HAS_H3 | WGDEVICE_HAS_H4;
+	}
+
+	awg_peer = &awg_iface->i_peers[0];
+	for (size_t i = 0; i < awg_iface->i_peers_count; ++i) {
+		peer = calloc(1, sizeof(*peer));
+		if (!peer)
+			goto out;
+
+		if (dev->first_peer == NULL)
+			dev->first_peer = peer;
+		else
+			dev->last_peer->next_peer = peer;
+		dev->last_peer = peer;
+
+		if (awg_peer->p_flags & AWG_PEER_HAS_PUBLIC) {
+			memcpy(peer->public_key, awg_peer->p_public, sizeof(peer->public_key));
+			peer->flags |= WGPEER_HAS_PUBLIC_KEY;
+		}
+		if (awg_peer->p_flags & AWG_PEER_HAS_PSK) {
+			memcpy(peer->preshared_key, awg_peer->p_psk, sizeof(peer->preshared_key));
+			if (!key_is_zero(peer->preshared_key))
+				peer->flags |= WGPEER_HAS_PRESHARED_KEY;
+		}
+		if (awg_peer->p_flags & AWG_PEER_HAS_PKA) {
+			peer->persistent_keepalive_interval = awg_peer->p_pka;
+			peer->flags |= WGPEER_HAS_PERSISTENT_KEEPALIVE_INTERVAL;
+		}
+		if (awg_peer->p_flags & AWG_PEER_HAS_ENDPOINT &&
+		    awg_peer->p_endpoint.sa_sa.sa_len <= sizeof(peer->endpoint.addr))
+			memcpy(&peer->endpoint.addr, &awg_peer->p_endpoint.sa_sa,
+			       awg_peer->p_endpoint.sa_sa.sa_len);
+
+		peer->rx_bytes = awg_peer->p_rxbytes;
+		peer->tx_bytes = awg_peer->p_txbytes;
+		peer->last_handshake_time.tv_sec  = awg_peer->p_last_handshake.tv_sec;
+		peer->last_handshake_time.tv_nsec = awg_peer->p_last_handshake.tv_nsec;
+
+		awg_aip = &awg_peer->p_aips[0];
+		for (size_t j = 0; j < awg_peer->p_aips_count; ++j) {
+			aip = calloc(1, sizeof(*aip));
+			if (!aip)
+				goto out;
+
+			if (peer->first_allowedip == NULL)
+				peer->first_allowedip = aip;
+			else
+				peer->last_allowedip->next_allowedip = aip;
+			peer->last_allowedip = aip;
+
+			aip->family = awg_aip->a_af;
+			if (awg_aip->a_af == AF_INET) {
+				memcpy(&aip->ip4, &awg_aip->a_addr.addr_ipv4, sizeof(aip->ip4));
+				aip->cidr = awg_aip->a_cidr;
+			} else if (awg_aip->a_af == AF_INET6) {
+				memcpy(&aip->ip6, &awg_aip->a_addr.addr_ipv6, sizeof(aip->ip6));
+				aip->cidr = awg_aip->a_cidr;
+			}
+			++awg_aip;
+		}
+		awg_peer = (struct awg_peer_io *)awg_aip;
+	}
+	*device = dev;
+	errno = 0;
+out:
+	ret = -errno;
+	free(awgdata.wgd_interface);
+	return ret;
+}
+
+static int kernel_set_device_awg(struct wgdevice *dev)
+{
+	struct awg_data_io awgdata = { .wgd_size = sizeof(struct awg_interface_io) };
+	struct awg_interface_io *awg_iface;
+	struct awg_peer_io *awg_peer;
+	struct awg_aip_io *awg_aip;
+	struct wgpeer *peer;
+	struct wgallowedip *aip;
+	int s = get_dgram_socket(), ret;
+	size_t peer_count, aip_count;
+
+	if (s < 0)
+		return -errno;
+
+	for_each_wgpeer(dev, peer) {
+		awgdata.wgd_size += sizeof(struct awg_peer_io);
+		for_each_wgallowedip(peer, aip)
+			awgdata.wgd_size += sizeof(struct awg_aip_io);
+	}
+	awg_iface = awgdata.wgd_interface = calloc(1, awgdata.wgd_size);
+	if (!awgdata.wgd_interface)
+		return -errno;
+	strlcpy(awgdata.wgd_name, dev->name, sizeof(awgdata.wgd_name));
+
+	if (dev->flags & WGDEVICE_HAS_PRIVATE_KEY) {
+		memcpy(awg_iface->i_private, dev->private_key, sizeof(awg_iface->i_private));
+		awg_iface->i_flags |= AWG_INTERFACE_HAS_PRIVATE;
+	}
+	if (dev->flags & WGDEVICE_HAS_LISTEN_PORT) {
+		awg_iface->i_port = dev->listen_port;
+		awg_iface->i_flags |= AWG_INTERFACE_HAS_PORT;
+	}
+	if (dev->flags & WGDEVICE_HAS_FWMARK) {
+		awg_iface->i_rtable = dev->fwmark;
+		awg_iface->i_flags |= AWG_INTERFACE_HAS_RTABLE;
+	}
+	if (dev->flags & WGDEVICE_REPLACE_PEERS)
+		awg_iface->i_flags |= AWG_INTERFACE_REPLACE_PEERS;
+
+	if ((dev->flags & (WGDEVICE_HAS_JC | WGDEVICE_HAS_JMIN | WGDEVICE_HAS_JMAX)) &&
+	    (dev->flags & WGDEVICE_HAS_JC)) {
+		awg_iface->i_jc   = dev->junk_packet_count;
+		awg_iface->i_jmin = dev->junk_packet_min_size;
+		awg_iface->i_jmax = dev->junk_packet_max_size;
+		awg_iface->i_flags |= AWG_INTERFACE_HAS_JC;
+	}
+	if ((dev->flags & (WGDEVICE_HAS_S1 | WGDEVICE_HAS_S2)) &&
+	    (dev->flags & WGDEVICE_HAS_S1)) {
+		awg_iface->i_s1 = dev->init_packet_junk_size;
+		awg_iface->i_s2 = dev->response_packet_junk_size;
+		awg_iface->i_flags |= AWG_INTERFACE_HAS_S12;
+	}
+	if ((dev->flags & (WGDEVICE_HAS_H1 | WGDEVICE_HAS_H2 | WGDEVICE_HAS_H3 | WGDEVICE_HAS_H4)) &&
+	    (dev->flags & WGDEVICE_HAS_H1) && dev->init_packet_magic_header) {
+		awg_iface->i_h1 = (uint32_t)strtoul(dev->init_packet_magic_header, NULL, 0);
+		awg_iface->i_h2 = dev->response_packet_magic_header ?
+		    (uint32_t)strtoul(dev->response_packet_magic_header, NULL, 0) : 2;
+		awg_iface->i_h3 = dev->underload_packet_magic_header ?
+		    (uint32_t)strtoul(dev->underload_packet_magic_header, NULL, 0) : 3;
+		awg_iface->i_h4 = dev->transport_packet_magic_header ?
+		    (uint32_t)strtoul(dev->transport_packet_magic_header, NULL, 0) : 4;
+		awg_iface->i_flags |= AWG_INTERFACE_HAS_H;
+	}
+
+	peer_count = 0;
+	awg_peer = &awg_iface->i_peers[0];
+	for_each_wgpeer(dev, peer) {
+		awg_peer->p_flags = AWG_PEER_HAS_PUBLIC;
+		memcpy(awg_peer->p_public, peer->public_key, sizeof(awg_peer->p_public));
+
+		if (peer->flags & WGPEER_HAS_PRESHARED_KEY) {
+			memcpy(awg_peer->p_psk, peer->preshared_key, sizeof(awg_peer->p_psk));
+			awg_peer->p_flags |= AWG_PEER_HAS_PSK;
+		}
+		if (peer->flags & WGPEER_HAS_PERSISTENT_KEEPALIVE_INTERVAL) {
+			awg_peer->p_pka = peer->persistent_keepalive_interval;
+			awg_peer->p_flags |= AWG_PEER_HAS_PKA;
+		}
+		if ((peer->endpoint.addr.sa_family == AF_INET ||
+		     peer->endpoint.addr.sa_family == AF_INET6) &&
+		    peer->endpoint.addr.sa_len <= sizeof(awg_peer->p_endpoint)) {
+			memcpy(&awg_peer->p_endpoint, &peer->endpoint.addr,
+			       peer->endpoint.addr.sa_len);
+			awg_peer->p_flags |= AWG_PEER_HAS_ENDPOINT;
+		}
+		if (peer->flags & WGPEER_REPLACE_ALLOWEDIPS)
+			awg_peer->p_flags |= AWG_PEER_REPLACE_AIPS;
+		if (peer->flags & WGPEER_REMOVE_ME)
+			awg_peer->p_flags |= AWG_PEER_REMOVE;
+
+		aip_count = 0;
+		awg_aip = &awg_peer->p_aips[0];
+		for_each_wgallowedip(peer, aip) {
+			awg_aip->a_af   = aip->family;
+			awg_aip->a_cidr = aip->cidr;
+			if (aip->family == AF_INET)
+				memcpy(&awg_aip->a_addr.addr_ipv4, &aip->ip4,
+				       sizeof(awg_aip->a_addr.addr_ipv4));
+			else if (aip->family == AF_INET6)
+				memcpy(&awg_aip->a_addr.addr_ipv6, &aip->ip6,
+				       sizeof(awg_aip->a_addr.addr_ipv6));
+			else
+				continue;
+			++aip_count;
+			++awg_aip;
+		}
+		awg_peer->p_aips_count = aip_count;
+		++peer_count;
+		awg_peer = (struct awg_peer_io *)awg_aip;
+	}
+	awg_iface->i_peers_count = peer_count;
+
+	if (ioctl(s, SIOCSAWG, (caddr_t)&awgdata) < 0)
+		goto out;
+	errno = 0;
+
+out:
+	ret = -errno;
+	free(awgdata.wgd_interface);
+	return ret;
+}
+
 static int kernel_get_device(struct wgdevice **device, const char *iface)
 {
+	if (is_awg_iface(iface))
+		return kernel_get_device_awg(device, iface);
+
 	struct wg_data_io wgdata = { .wgd_size = 0 };
 	struct wg_interface_io *wg_iface;
 	struct wg_peer_io *wg_peer;
@@ -293,6 +590,9 @@ out:
 
 static int kernel_set_device(struct wgdevice *dev)
 {
+	if (is_awg_iface(dev->name))
+		return kernel_set_device_awg(dev);
+
 	struct wg_data_io wgdata = { .wgd_size = sizeof(struct wg_interface_io) };
 	struct wg_interface_io *wg_iface;
 	struct wg_peer_io *wg_peer;
