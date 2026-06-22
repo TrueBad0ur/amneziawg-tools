@@ -161,6 +161,15 @@ static int kernel_get_device_awg(struct wgdevice **device, const char *iface)
 			goto out;
 
 		dev->flags |= WGDEVICE_HAS_H1 | WGDEVICE_HAS_H2 | WGDEVICE_HAS_H3 | WGDEVICE_HAS_H4;
+	} else {
+		/* Non-root GET returns no H flags — set defaults to avoid NULL deref in show.c */
+		dev->init_packet_magic_header     = strdup("1");
+		dev->response_packet_magic_header = strdup("2");
+		dev->underload_packet_magic_header = strdup("3");
+		dev->transport_packet_magic_header = strdup("4");
+		if (!dev->init_packet_magic_header || !dev->response_packet_magic_header ||
+		    !dev->underload_packet_magic_header || !dev->transport_packet_magic_header)
+			goto out;
 	}
 
 	awg_peer = &awg_iface->i_peers[0];
